@@ -18,7 +18,7 @@ Usage:
   2. Run:  python3 download_bunny_videos.py
   3. Videos are saved to ./downloaded_videos/ (configurable)
 
-Required: pip install requests
+Required: pip install requests tqdm
 """
 
 import os
@@ -33,10 +33,19 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from dotenv import load_dotenv
+try:
+    from tqdm import tqdm
+    _TQDM_AVAILABLE = True
+except ImportError:
+    _TQDM_AVAILABLE = False
+
+# Load environment variables from .env file (if present)
+load_dotenv()
 
 # ─────────────────────────── Configuration ───────────────────────────
 
-# Set these via environment variables or edit directly here
+# Set these via .env file or environment variables
 LIBRARY_ID = os.environ.get("BUNNY_LIBRARY_ID", "")
 API_KEY = os.environ.get("BUNNY_API_KEY", "")
 
@@ -52,6 +61,9 @@ CDN_HOSTNAME = os.environ.get("BUNNY_CDN_HOSTNAME", "")
 #   - "original": Downloads the original uploaded file (requires "Keep Original File" enabled)
 #   - "mp4_fallback": Downloads the MP4 fallback at a given resolution (requires "MP4 Fallback" enabled)
 DOWNLOAD_MODE = os.environ.get("BUNNY_DOWNLOAD_MODE", "original")
+
+# Optional: restrict downloads to a specific collection (Bunny.net collection GUID)
+COLLECTION_ID = os.environ.get("BUNNY_COLLECTION_ID", "")
 
 # For mp4_fallback mode: which resolution to prefer (tries in order)
 PREFERRED_RESOLUTIONS = ["2160", "1080", "720", "480", "360"]
@@ -75,9 +87,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("bunny-downloader")
 
+def _tqdm_info(msg: str):
+    """Log an INFO message without triggering a tqdm bar redraw.
+
+    When tqdm bars are active, calling log.info() causes tqdm to detect
+    the terminal write and repaint all bars below the new text.  Using
+    tqdm.write() inserts the line *above* the bars cleanly.
+    """
+    if _TQDM_AVAILABLE:
+        tqdm.write(f"{time.strftime('%H:%M:%S')} [INFO] {msg}")
+    else:
+        log.info(msg)
+
 # ─────────────────────────── Progress Tracker ────────────────────────
 
 class ProgressTracker:
+    """Thread-safe tracker for overall download progress across all files."""
+
     def __init__(self, total: int):
         self.total = total
         self.completed = 0
@@ -86,6 +112,25 @@ class ProgressTracker:
         self.bytes_downloaded = 0
         self.start_time = time.time()
         self._lock = Lock()
+        # Track which tqdm position slots are in use so concurrent bars don't overlap
+        self._active_positions: set[int] = set()
+
+    # ── Position management for per-file tqdm bars ────────────────────
+
+    def acquire_bar_position(self) -> int:
+        """Return the lowest free tqdm position (1-based, 0 is reserved for overall)."""
+        with self._lock:
+            pos = 1
+            while pos in self._active_positions:
+                pos += 1
+            self._active_positions.add(pos)
+            return pos
+
+    def release_bar_position(self, pos: int):
+        with self._lock:
+            self._active_positions.discard(pos)
+
+    # ── Completion callbacks ──────────────────────────────────────────
 
     def mark_completed(self, size_bytes: int = 0):
         with self._lock:
@@ -114,11 +159,15 @@ class ProgressTracker:
             eta = "calculating..."
 
         mb = self.bytes_downloaded / (1024 * 1024)
-        log.info(
+        msg = (
             f"Progress: {done}/{self.total} "
             f"(✓ {self.completed} downloaded, ⏭ {self.skipped} skipped, ✗ {self.failed} failed) "
             f"| {mb:.1f} MB | ETA: {eta}"
         )
+        if _TQDM_AVAILABLE:
+            tqdm.write(f"{time.strftime('%H:%M:%S')} [INFO] {msg}")
+        else:
+            log.info(msg)
 
 # ─────────────────────────── API Functions ───────────────────────────
 
@@ -189,6 +238,66 @@ def list_all_videos(library_id: str, api_key: str, collection_id: str = "") -> l
 
     log.info(f"Total videos found: {len(all_videos)}")
     return all_videos
+
+
+def get_collection_name(library_id: str, api_key: str, collection_id: str) -> str:
+    """Fetch the display name of a Bunny.net Stream collection.
+
+    Returns the collection name on success, or the collection_id as a fallback.
+    """
+    url = f"https://video.bunnycdn.com/library/{library_id}/collections/{collection_id}"
+    headers = {"AccessKey": api_key, "Accept": "application/json"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        name = data.get("name") or data.get("Name") or ""
+        if name:
+            log.info(f"Collection name: {name}")
+            return name
+    except Exception as e:
+        log.warning(f"Could not fetch collection name (will use ID as folder name): {e}")
+    return collection_id
+
+
+def list_all_collections(library_id: str, api_key: str) -> dict[str, str]:
+    """Fetch all Bunny.net Stream collections and return a {collection_id: safe_folder_name} map."""
+    url = f"https://video.bunnycdn.com/library/{library_id}/collections"
+    headers = {"AccessKey": api_key, "Accept": "application/json"}
+    collection_map: dict[str, str] = {}
+    page = 1
+
+    log.info("Fetching collection list to organise videos into folders...")
+    while True:
+        params = {"page": page, "itemsPerPage": 100}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            log.warning(f"Could not fetch collections page {page}: {e}")
+            break
+
+        items = data.get("items") or data.get("Items", [])
+        if not items:
+            break
+
+        for col in items:
+            col_id = (
+                col.get("guid") or col.get("Guid")
+                or col.get("id") or col.get("Id") or ""
+            )
+            col_name = col.get("name") or col.get("Name") or col_id
+            if col_id:
+                collection_map[col_id] = sanitize_filename(col_name)
+
+        if len(items) < 100:
+            break
+        page += 1
+        time.sleep(0.2)
+
+    log.info(f"Found {len(collection_map)} collection(s).")
+    return collection_map
 
 
 def get_video_resolutions(video: dict) -> list[str]:
@@ -313,10 +422,13 @@ def _attempt_download(
     url: str, filepath: Path, video_id: str, title: str, tracker: ProgressTracker,
     storage_key: str = "",
 ) -> dict:
-    """Attempt to download from a specific URL with retries."""
+    """Attempt to download from a specific URL with retries and a real-time progress bar."""
     temp_path = filepath.with_suffix(filepath.suffix + ".part")
+    # Short label for the progress bar (max 40 chars)
+    bar_label = title[:40].ljust(40)
 
     for attempt in range(MAX_RETRIES):
+        bar = None
         try:
             # Support resuming partial downloads
             headers = {}
@@ -338,25 +450,54 @@ def _attempt_download(
             if resp.status_code not in (200, 206):
                 raise requests.HTTPError(f"HTTP {resp.status_code}")
 
-            # Get total size
+            # Get total size for progress bar
             content_length = resp.headers.get("Content-Length")
             total_size = int(content_length) + start_byte if content_length else None
+
+            # Acquire a unique tqdm position so parallel bars don't overlap
+            pos = tracker.acquire_bar_position() if _TQDM_AVAILABLE else 0
 
             # Write to temp file
             mode_flag = "ab" if start_byte > 0 and resp.status_code == 206 else "wb"
             downloaded = start_byte if mode_flag == "ab" else 0
 
-            with open(temp_path, mode_flag) as f:
-                for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
+            if _TQDM_AVAILABLE:
+                bar = tqdm(
+                    total=total_size,
+                    initial=start_byte,
+                    unit="B",
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=bar_label,
+                    position=pos,
+                    leave=False,          # clear bar when done so log stays clean
+                    dynamic_ncols=True,
+                    bar_format=(
+                        "{desc} |{bar}| {percentage:5.1f}% "
+                        "{n_fmt}/{total_fmt} @ {rate_fmt} ETA {remaining}"
+                    ),
+                )
+
+            try:
+                with open(temp_path, mode_flag) as f:
+                    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+                            chunk_len = len(chunk)
+                            downloaded += chunk_len
+                            if bar is not None:
+                                bar.update(chunk_len)
+            finally:
+                if bar is not None:
+                    bar.close()
+                    bar = None
+                tracker.release_bar_position(pos)
 
             # Rename temp file to final
             temp_path.rename(filepath)
             file_size = filepath.stat().st_size
 
-            log.info(f"✓ Downloaded: {title[:60]} ({file_size / (1024*1024):.1f} MB)")
+            _tqdm_info(f"✓ Downloaded: {title[:60]} ({file_size / (1024*1024):.1f} MB)")
             tracker.mark_completed(file_size)
 
             return {
@@ -367,6 +508,10 @@ def _attempt_download(
             }
 
         except Exception as e:
+            # Make sure the bar is closed on unexpected errors
+            if bar is not None:
+                bar.close()
+                bar = None
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BACKOFF_BASE ** (attempt + 1)
                 log.warning(
@@ -376,9 +521,7 @@ def _attempt_download(
                 time.sleep(wait)
             else:
                 log.error(f"✗ Failed to download '{title[:60]}' after {MAX_RETRIES} attempts: {e}")
-                # Clean up partial file on final failure
-                if temp_path.exists():
-                    pass  # Keep partial for potential resume on re-run
+                # Keep partial file for potential resume on re-run
                 return {"video_id": video_id, "status": "failed", "error": str(e)}
 
     return {"video_id": video_id, "status": "failed"}
@@ -508,7 +651,7 @@ def main():
     parser.add_argument("--links-only", action="store_true", help="Export all download URLs to .txt and .json files without downloading")
     parser.add_argument("--links-format", default="all", choices=["all", "txt", "json", "csv"], help="Output format for --links-only (default: all)")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be downloaded without downloading")
-    parser.add_argument("--collection", default="", help="Only download videos from this collection ID (Bunny.net collection GUID)")
+    parser.add_argument("--collection", default=COLLECTION_ID, help="Only download videos from this collection ID (Bunny.net collection GUID)")
     args = parser.parse_args()
 
     # Validate configuration
@@ -533,6 +676,14 @@ def main():
 
     # Create output directory
     output_dir = Path(args.output_dir).resolve()
+
+    # If a collection is specified, place downloads in a named subfolder
+    if args.collection:
+        collection_name = get_collection_name(args.library_id, args.api_key, args.collection)
+        safe_collection_name = sanitize_filename(collection_name)
+        output_dir = output_dir / safe_collection_name
+        log.info(f"Collection output folder: {output_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "_download_manifest.json"
 
@@ -584,13 +735,39 @@ def main():
             }
     save_manifest(manifest, manifest_path)
 
+    # Build collection map when no specific collection filter is set
+    # (used to route each video into its own named subfolder)
+    collection_map: dict[str, str] = {}
+    if not args.collection:
+        collection_map = list_all_collections(args.library_id, args.api_key)
+
+    def _video_output_dir(video: dict) -> Path:
+        """Return the output directory for a single video.
+
+        - If a collection filter was provided, all videos already go into
+          the collection-named output_dir set earlier.
+        - Otherwise, look up the video's own collectionId and return the
+          matching named subfolder (creating it if needed).  Videos with no
+          collection land directly in output_dir.
+        """
+        if args.collection or not collection_map:
+            return output_dir
+        col_id = video.get("collectionId") or video.get("CollectionId") or ""
+        if col_id and col_id in collection_map:
+            sub = output_dir / collection_map[col_id]
+            sub.mkdir(parents=True, exist_ok=True)
+            return sub
+        return output_dir
+
     if args.dry_run:
         log.info("\n--- Dry Run ---")
         for v in videos:
             url, filename = build_download_url(v, args.cdn_hostname, args.mode)
-            filepath = output_dir / filename
+            vdir = _video_output_dir(v)
+            filepath = vdir / filename
             exists = "✓ EXISTS" if filepath.exists() else "  NEW"
-            log.info(f"  {exists} → {filename}")
+            rel = filepath.relative_to(output_dir)
+            log.info(f"  {exists} → {rel}")
             log.info(f"         URL: {url}")
         log.info(f"\nTotal: {len(videos)} videos")
         sys.exit(0)
@@ -604,7 +781,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {
             executor.submit(
-                download_video, video, args.cdn_hostname, output_dir, args.mode, tracker, args.storage_key
+                download_video, video, args.cdn_hostname, _video_output_dir(video),
+                args.mode, tracker, args.storage_key
             ): video
             for video in videos
         }
