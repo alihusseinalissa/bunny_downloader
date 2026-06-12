@@ -344,7 +344,7 @@ def build_download_url(video: dict, cdn_hostname: str, mode: str) -> tuple[str, 
         # Derive storage zone name from CDN hostname (strip ".b-cdn.net")
         storage_zone = cdn_hostname.replace(".b-cdn.net", "")
         url = f"https://storage.bunnycdn.com/{storage_zone}/{video_id}/"
-        filename = f"{safe_title}___{video_id}.mp4"
+        filename = f"{safe_title}.mp4"
     else:
         # MP4 fallback mode — pick the highest resolution actually available for this video
         resolutions = get_video_resolutions(video)
@@ -354,7 +354,7 @@ def build_download_url(video: dict, cdn_hostname: str, mode: str) -> tuple[str, 
         else:
             # No known resolution available — fall back to first in PREFERRED_RESOLUTIONS
             url = f"https://{cdn_hostname}/{video_id}/play_{PREFERRED_RESOLUTIONS[0]}p.mp4"
-        filename = f"{safe_title}___{video_id}.mp4"
+        filename = f"{safe_title}.mp4"
 
     return url, filename
 
